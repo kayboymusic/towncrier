@@ -1,0 +1,41 @@
+# Env
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+.pnpm-store/
+.turbo/
+.next/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.uv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Build artifacts
+build/
+out/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Supabase
+supabase/.branches/
+supabase/.temp/
+
+# Logs
+*.log

@@ -1,0 +1,30 @@
+# Optional local services.
+# By default Town Crier uses hosted Supabase + Upstash, so you don't need this
+# for the MVP. Spin it up if you want to run Redis (or Postgres) locally
+# instead of Upstash/Supabase.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: town-crier-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # Uncomment to run Postgres locally instead of Supabase.
+  # Migration in supabase/migrations/0001_init.sql can be applied with:
+  #   psql postgres://postgres:postgres@localhost:5432/postgres -f supabase/migrations/0001_init.sql
+  #
+  # postgres:
+  #   image: pgvector/pgvector:pg15
+  #   container_name: town-crier-postgres
+  #   environment:
+  #     POSTGRES_PASSWORD: postgres
+  #     POSTGRES_DB: postgres
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+
+# volumes:
+#   postgres-data:

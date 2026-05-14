@@ -1,0 +1,9 @@
+# Minimal Supabase CLI config so `supabase db push` knows where it is.
+# The project_id is set when you run `supabase link --project-ref <ref>`.
+
+project_id = "town-crier"
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
