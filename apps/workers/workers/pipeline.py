@@ -1,13 +1,19 @@
 """End-to-end ingestion pipeline.
 
-For each enabled source:
-    fetch RSS → for each entry:
-        upsert item (by url) → if new:
-            embed → dedupe check → summarize → classify → persist
+Per run cycle:
+    1. For each enabled source, poll the RSS feed and upsert every entry
+       into `items` (cheap, no AI calls).
+    2. Walk every item that's missing a summary OR embedding and fill it in.
+       This second pass catches both "new this cycle" and "stranded from a
+       prior crash / rate limit / partial run".
 
-The pipeline is idempotent. Re-running it does not create duplicates;
-unique constraints on items.url and primary keys on the child tables
-make every step a safe upsert.
+Idempotency guarantees:
+    - `items.url` unique → re-fetching the same RSS entry never duplicates.
+    - Child tables (`item_summaries`, `item_embeddings`, `item_categories`)
+      are upserted by `item_id`, so re-processing overwrites cleanly.
+    - Dedupe runs only the first time we successfully embed an item. If the
+      item is already in `items` and we're just back-filling missing parts,
+      dedupe is skipped (we don't want to delete a row we're trying to fix).
 """
 
 from __future__ import annotations
@@ -33,12 +39,14 @@ class PipelineStats:
     sources: int = 0
     fetched: int = 0
     new_items: int = 0
+    enriched: int = 0
     deduped: int = 0
-    summarized: int = 0
     errors: int = 0
 
 
-def _run_for_source(source_row: dict, stats: PipelineStats) -> None:
+def _ingest_items_from_source(source_row: dict, stats: PipelineStats) -> None:
+    """Phase 1: cheap. Poll RSS, upsert items. No AI calls."""
+    sb = supabase()
     result = poll(
         source_id=source_row["id"],
         source_name=source_row["name"],
@@ -50,12 +58,11 @@ def _run_for_source(source_row: dict, stats: PipelineStats) -> None:
 
     for raw in result.items:
         try:
-            _process_item(raw, stats)
+            _upsert_item_row(raw, stats)
         except Exception as exc:
             stats.errors += 1
-            log.error("pipeline.item_failed", url=raw.url, error=str(exc))
+            log.error("pipeline.upsert_failed", url=raw.url, error=str(exc))
 
-    sb = supabase()
     sb.table("sources").update(
         {
             "last_polled_at": "now()",
@@ -65,17 +72,14 @@ def _run_for_source(source_row: dict, stats: PipelineStats) -> None:
     ).eq("id", source_row["id"]).execute()
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=1, max=8))
-def _process_item(raw: RawItem, stats: PipelineStats) -> None:
+def _upsert_item_row(raw: RawItem, stats: PipelineStats) -> None:
     sb = supabase()
-
     existing = (
-        sb.table("items").select("id").eq("url", raw.url).limit(1).execute()
+        sb.table("items").select("id").eq("url", raw.url).limit(1).execute().data
     )
-    if existing.data:
-        return  # already ingested
+    if existing:
+        return  # row already present; enrichment pass will handle missing parts
 
-    # Reserve the row first so concurrent runs don't double-process.
     inserted = (
         sb.table("items")
         .upsert(
@@ -94,62 +98,154 @@ def _process_item(raw: RawItem, stats: PipelineStats) -> None:
         )
         .execute()
     )
-    if not inserted.data:
-        return
-    item_id = inserted.data[0]["id"]
-    stats.new_items += 1
+    if inserted.data:
+        stats.new_items += 1
 
-    summary_input = f"{raw.title}\n\n{raw.raw_content or ''}"
-    vector = embed(summary_input)
 
-    dup = find_duplicate(vector)
-    if dup:
-        # Roll back: delete the placeholder row we just created.
-        sb.table("items").delete().eq("id", item_id).execute()
-        stats.deduped += 1
-        stats.new_items -= 1
-        return
+@retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(initial=1, max=8))
+def _enrich_one(item: dict, stats: PipelineStats) -> None:
+    """Phase 2: fill in missing summary/embedding/categories for one item.
 
-    sb.table("item_embeddings").upsert(
-        {
-            "item_id": item_id,
-            "model": settings.openai_embedding_model,
-            "embedding": vector,
-        }
-    ).execute()
+    `item` is the joined row from the SQL below: id, url, title, author,
+    raw_content, source_name, has_summary, has_embedding, has_categories.
+    """
+    sb = supabase()
+    item_id = item["id"]
 
-    summary = summarize(title=raw.title, source=raw.source_name, content=raw.raw_content or "")
-    sb.table("item_summaries").upsert(
-        {
-            "item_id": item_id,
-            "model": summary.model,
-            "short": summary.short,
-            "bullets": summary.bullets,
-            "impact": summary.impact,
-        }
-    ).execute()
-    stats.summarized += 1
+    title = item["title"]
+    content = item.get("raw_content") or ""
+    source_name = item.get("source_name") or "unknown"
 
-    cats = classify(title=raw.title, content=raw.raw_content or "")
-    if cats:
-        sb.table("item_categories").upsert(
-            [{"item_id": item_id, "category": c, "confidence": 0.9} for c in cats]
+    if not item["has_embedding"]:
+        vector = embed(f"{title}\n\n{content}")
+
+        # Dedupe only runs the first time we embed (i.e. fresh items).
+        # Skipping dedupe for items already in the DB avoids ever deleting
+        # the row we're trying to back-fill.
+        if not item["has_summary"]:
+            dup = find_duplicate(vector)
+            if dup and dup != item_id:
+                sb.table("items").delete().eq("id", item_id).execute()
+                stats.deduped += 1
+                return
+
+        sb.table("item_embeddings").upsert(
+            {
+                "item_id": item_id,
+                "model": settings.openai_embedding_model,
+                "embedding": vector,
+            }
         ).execute()
 
+    if not item["has_summary"]:
+        s = summarize(title=title, source=source_name, content=content)
+        sb.table("item_summaries").upsert(
+            {
+                "item_id": item_id,
+                "model": s.model,
+                "short": s.short,
+                "bullets": s.bullets,
+                "impact": s.impact,
+            }
+        ).execute()
+        stats.enriched += 1
 
-def run_once() -> PipelineStats:
+    if not item["has_categories"]:
+        cats = classify(title=title, content=content)
+        if cats:
+            sb.table("item_categories").upsert(
+                [{"item_id": item_id, "category": c, "confidence": 0.9} for c in cats]
+            ).execute()
+
+
+def _pending_items(limit: int = 500) -> list[dict]:
+    """Items that are missing a summary OR embedding (the AI bits)."""
+    import psycopg
+
+    if not settings.database_url:
+        # Without raw SQL access we can only do best-effort via PostgREST.
+        sb = supabase()
+        rows = (
+            sb.table("items")
+            .select("id,url,title,author,raw_content,sources(name)")
+            .order("published_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data
+            or []
+        )
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "url": r["url"],
+                    "title": r["title"],
+                    "author": r.get("author"),
+                    "raw_content": r.get("raw_content"),
+                    "source_name": (r.get("sources") or {}).get("name"),
+                    "has_summary": False,  # we don't know; let upsert handle it
+                    "has_embedding": False,
+                    "has_categories": False,
+                }
+            )
+        return out
+
+    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select
+              i.id,
+              i.url,
+              i.title,
+              i.author,
+              i.raw_content,
+              s.name as source_name,
+              (sm.item_id is not null) as has_summary,
+              (em.item_id is not null) as has_embedding,
+              exists(select 1 from item_categories ic where ic.item_id = i.id) as has_categories
+            from items i
+            left join sources s on s.id = i.source_id
+            left join item_summaries sm on sm.item_id = i.id
+            left join item_embeddings em on em.item_id = i.id
+            where sm.item_id is null or em.item_id is null
+            order by i.published_at desc
+            limit %s
+            """,
+            (limit,),
+        )
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, row, strict=True)) for row in cur.fetchall()]
+
+
+def _enrich_pending(stats: PipelineStats, batch_limit: int = 500) -> None:
+    pending = _pending_items(limit=batch_limit)
+    log.info("pipeline.enrich_pending", count=len(pending))
+    for item in pending:
+        try:
+            _enrich_one(item, stats)
+        except Exception as exc:
+            stats.errors += 1
+            log.error("pipeline.enrich_failed", item_id=item["id"], error=str(exc))
+
+
+def run_once(*, enrich_limit: int = 500) -> PipelineStats:
     sb = supabase()
     stats = PipelineStats()
     sources = sb.table("sources").select("*").eq("enabled", True).execute().data
     stats.sources = len(sources)
     log.info("pipeline.start", sources=stats.sources)
 
+    # Phase 1 — cheap, no AI calls. Get every new RSS entry into items.
     for row in sources:
         try:
-            _run_for_source(row, stats)
+            _ingest_items_from_source(row, stats)
         except Exception as exc:
             stats.errors += 1
             log.error("pipeline.source_failed", source=row.get("name"), error=str(exc))
+
+    # Phase 2 — expensive, AI calls. Back-fill anything missing.
+    _enrich_pending(stats, batch_limit=enrich_limit)
 
     log.info("pipeline.done", **stats.__dict__)
     return stats

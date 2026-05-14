@@ -15,7 +15,7 @@ import typer
 from rich import print
 
 from workers.logging import configure, get_logger
-from workers.pipeline import run_once
+from workers.pipeline import PipelineStats, _enrich_pending, run_once
 from workers.seed import seed_companies as _seed_companies
 from workers.seed import seed_sources as _seed_sources
 
@@ -51,6 +51,20 @@ def run_once_cmd(
         _seed_sources()
         _seed_companies()
     stats = run_once()
+    print(stats)
+
+
+@app.command("enrich-pending")
+def enrich_pending_cmd(
+    limit: int = typer.Option(500, help="Max items to enrich in one run"),
+) -> None:
+    """Back-fill summaries/embeddings/categories for items missing them.
+
+    Useful after a partial failure (rate limit, key error, network blip)
+    when items are already in the DB but the AI step never finished.
+    """
+    stats = PipelineStats()
+    _enrich_pending(stats, batch_limit=limit)
     print(stats)
 
 
